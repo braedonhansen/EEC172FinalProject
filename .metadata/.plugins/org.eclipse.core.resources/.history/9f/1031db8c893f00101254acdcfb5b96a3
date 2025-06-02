@@ -1,0 +1,27 @@
+#include "pinmux.h"
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "rom_map.h"
+#include "spi.h"
+
+// Example: using the on-board SPI0 (GSPI) pins on CC3200 LaunchPad.
+// Adjust these if you’re using different GPIO pins for SD card.
+void
+PinMuxConfig(void)
+{
+    // Unlock PA0-7 if needed (see Technical Reference Manual)
+
+    // SPI0: CLK = GPIO18, MISO = GPIO19, MOSI = GPIO17, CS = GPIO16
+    MAP_PinTypeSPI(PIN_18, PIN_MODE_7);  // SPI_CLK
+    MAP_PinTypeSPI(PIN_19, PIN_MODE_7);  // SPI_MISO
+    MAP_PinTypeSPI(PIN_17, PIN_MODE_7);  // SPI_MOSI
+    MAP_PinTypeSPI(PIN_16, PIN_MODE_7);  // SPI_CS
+
+    // UART0: TX = GPIO55, RX = GPIO57 (for example)
+    MAP_PinTypeUART(PIN_55, PIN_MODE_3);
+    MAP_PinTypeUART(PIN_57, PIN_MODE_3);
+
+    // Initialize the on-board LEDs (optional)
+    GPIO_IF_LedConfigure(LED1|LED2|LED3);
+    GPIO_IF_LedOff(MCU_ALL_LED_IND);
+}

@@ -1,0 +1,580 @@
+//*****************************************************************************
+//
+// Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com/ 
+// (Modified to implement SD-card SPI + FatFs write)
+//
+//*****************************************************************************
+
+// Standard includes
+#include <string.h>
+#include <stdint.h>
+
+// TI Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "hw_ints.h"
+#include "spi.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "prcm.h"
+#include "uart.h"
+#include "interrupt.h"
+
+// Common interface includes
+#include "uart_if.h"
+#include "pinmux.h"
+
+// FatFs includes (from Elm-Chan)
+#include "ff.h"
+#include "diskio.h"
+
+//*****************************************************************************
+//
+// Application version
+//
+//*****************************************************************************
+#define APPLICATION_VERSION  "1.4.0"
+
+//*****************************************************************************
+//                 GLOBAL VARIABLES -- Start
+//*****************************************************************************
+static FATFS g_sFatFs;    // FatFs filesystem object
+static FIL   g_sFile;     // FatFs file object
+
+// A small 512-byte buffer to hold one block of data
+static uint8_t g_ucSDBlock[512];
+//*****************************************************************************
+//                 GLOBAL VARIABLES -- End
+//*****************************************************************************
+
+//*****************************************************************************
+// SPI -> SD-Command Definitions (SPI mode)
+//*****************************************************************************
+#define SD_CMD0    0x40  /* GO_IDLE_STATE */
+#define SD_CMD8    0x48  /* SEND_IF_COND       */
+#define SD_CMD55   0xF7  /* APP_CMD            */
+#define SD_ACMD41  0x69  /* SD_SEND_OP_COND    */
+#define SD_CMD58   0x7A  /* READ_OCR           */
+#define SD_CMD16   0x50  /* SET_BLOCKLEN       */
+#define SD_CMD17   0x51  /* READ_SINGLE_BLOCK  */
+#define SD_CMD24   0x58  /* WRITE_SINGLE_BLOCK */
+
+#define SD_TOKEN_START_BLOCK  0xFE
+
+//*****************************************************************************
+// Prototypes for local functions
+//*****************************************************************************
+static void   BoardInit(void);
+static void   SD_HWInit(void);
+static int    SD_SendCmd(uint8_t cmd, uint32_t arg, uint8_t crc);
+static int    SD_WaitReady(void);
+static int    SD_InitCard(void);
+static int    SD_ReadBlock(uint32_t block_addr, uint8_t *buff);
+static int    SD_WriteBlock(uint32_t block_addr, const uint8_t *buff);
+
+//*****************************************************************************
+//
+//! SD card: Send one byte over SPI and receive one byte
+//! Returns: the data read from MISO
+//
+//*****************************************************************************
+static uint8_t
+SD_SpiTransfer(
+    uint8_t u8Data
+    )
+{
+    unsigned long ulTemp;
+    MAP_SPIDataPut(GSPI_BASE, u8Data);
+    MAP_SPIDataGet(GSPI_BASE, &ulTemp);
+    return (uint8_t)ulTemp;
+}
+
+//*****************************************************************************
+//
+//! SD card: Assert CS (active LOW) and send 0xFF to give card time to catch up
+//
+//*****************************************************************************
+static void
+SD_CS_Assert(void)
+{
+    MAP_SPICSDisable(GSPI_BASE); // CS = LOW (because TI CC3200 SPI CS is active-low)
+    // Give card 8 clock cycles to recognize CS low
+    SD_SpiTransfer(0xFF);
+}
+
+//*****************************************************************************
+//
+//! SD card: Deassert CS (CS HIGH) and send 8 clocks
+//
+//*****************************************************************************
+static void
+SD_CS_Deassert(void)
+{
+    MAP_SPICSEnable(GSPI_BASE); // CS = HIGH
+    // 8 extra clocks
+    SD_SpiTransfer(0xFF);
+}
+
+//*****************************************************************************
+//
+//! SD card: Wait until card is not busy (0xFF). Returns 0 on success, or -1 on timeout.
+//
+//*****************************************************************************
+static int
+SD_WaitReady(void)
+{
+    uint32_t timeout = 50000;
+    uint8_t  resp;
+
+    do {
+        resp = SD_SpiTransfer(0xFF);
+        if (resp == 0xFF) {
+            return 0;
+        }
+    } while (--timeout);
+
+    return -1; // timed out
+}
+
+//*****************************************************************************
+//
+//! SD card: Send a 6-byte command (with 0x40 | index, 32-bit argument, 8-bit CRC)
+//! Returns R1 response (0x00 = OK, or nonzero error code).
+//
+//*****************************************************************************
+static int
+SD_SendCmd(
+    uint8_t  cmd,
+    uint32_t arg,
+    uint8_t  crc
+    )
+{
+    uint8_t r1;
+    int     i;
+
+    // Wait until card is ready (not busy)
+    if (SD_WaitReady() != 0) {
+        return -1;
+    }
+
+    // Send command token
+    SD_SpiTransfer(cmd);
+    SD_SpiTransfer((uint8_t)(arg >> 24));
+    SD_SpiTransfer((uint8_t)(arg >> 16));
+    SD_SpiTransfer((uint8_t)(arg >> 8));
+    SD_SpiTransfer((uint8_t)(arg));
+    SD_SpiTransfer(crc | 0x01); // bit0 = 1
+
+    // Wait for a valid R1 response (MSB = 0). Max 8 bytes.
+    for (i = 0; i < 8; i++) {
+        r1 = SD_SpiTransfer(0xFF);
+        if ((r1 & 0x80) == 0) {
+            break;
+        }
+    }
+    return r1;
+}
+
+//*****************************************************************************
+//
+//! SD card: Initialize card to SPI mode, set block length to 512.
+//! Returns 0 on success, else -1.
+//
+//*****************************************************************************
+static int
+SD_InitCard(void)
+{
+    uint8_t  resp[5];
+    int      i;
+    uint8_t  r1;
+
+    // 1) Send >=74 clock cycles with CS = HIGH
+    SD_CS_Deassert();
+    for (i = 0; i < 10; i++) {
+        SD_SpiTransfer(0xFF);
+    }
+
+    // 2) CMD0: Enter Idle State
+    SD_CS_Assert();
+    r1 = SD_SendCmd(SD_CMD0, 0x00000000, 0x95);
+    if (r1 != 0x01) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    // 3) CMD8: Send Interface Condition (check voltage range)
+    r1 = SD_SendCmd(SD_CMD8, 0x000001AA, 0x87);
+    if (r1 == 0x01) {
+        // Read rest of R7 (4 bytes)
+        for (i = 0; i < 4; i++) {
+            resp[i] = SD_SpiTransfer(0xFF);
+        }
+        // If echo back (0x000001AA) is correct, it’s v2.0+ card.
+        if ((resp[2] != 0x01) || (resp[3] != 0xAA)) {
+            SD_CS_Deassert();
+            return -1;
+        }
+        // 4) ACMD41 with HCS until ready
+        do {
+            SD_SendCmd(SD_CMD55, 0x00000000, 0x01);
+            r1 = SD_SendCmd(SD_ACMD41, 0x40000000, 0x01);
+        } while (r1 == 0x01);
+
+        // 5) CMD58: Read OCR to check CCS (bit30)
+        r1 = SD_SendCmd(SD_CMD58, 0x00000000, 0x01);
+        if (r1 != 0x00) {
+            SD_CS_Deassert();
+            return -1;
+        }
+        // Read OCR (4 bytes)
+        for (i = 0; i < 4; i++) {
+            resp[i] = SD_SpiTransfer(0xFF);
+        }
+        // If OCR[0] & 0x40 => SDHC/SDXC (block-addressing). Otherwise SDSC (byte).
+        // We ignore SDSC vs. SDHC detail because we’ll always issue 512-byte blocks below.
+
+        // 6) CMD16: Force 512-byte block length on SDSC. If SDHC, this is ignored.
+        r1 = SD_SendCmd(SD_CMD16, 512, 0x01);
+        if (r1 != 0x00) {
+            SD_CS_Deassert();
+            return -1;
+        }
+    }
+    else {
+        // Card didn’t accept CMD8 -> fall back to SDSC (v1.x)
+        // Loop ACMD41 with arg=0 until r1=0
+        do {
+            SD_SendCmd(SD_CMD55, 0x00000000, 0x01);
+            r1 = SD_SendCmd(SD_ACMD41, 0x00000000, 0x01);
+        } while (r1 == 0x01);
+
+        // CMD16 to set 512
+        r1 = SD_SendCmd(SD_CMD16, 512, 0x01);
+        if (r1 != 0x00) {
+            SD_CS_Deassert();
+            return -1;
+        }
+    }
+
+    SD_CS_Deassert();
+    SD_SpiTransfer(0xFF); // give extra clocks
+    return 0;
+}
+
+//*****************************************************************************
+//
+//! SD card: Read exactly one 512-byte block via CMD17.
+//! block_addr is block-index (not byte-address) for both SDSC and SDHC/SDXC,
+//! because we set CMD16=512 on SDSC above.
+//! Returns 0 on success; buff[0..511] is filled. Otherwise -1.
+//
+//*****************************************************************************
+static int
+SD_ReadBlock(
+    uint32_t block_addr,
+    uint8_t *buff
+    )
+{
+    uint8_t token;
+    uint16_t timeout;
+    int     i;
+
+    SD_CS_Assert();
+
+    if (SD_SendCmd(SD_CMD17, block_addr, 0x01) != 0x00) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    // Wait for data token (0xFE)
+    timeout = 0xFFFF;
+    do {
+        token = SD_SpiTransfer(0xFF);
+    } while ((token != SD_TOKEN_START_BLOCK) && --timeout);
+    if (timeout == 0) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    // Read 512 bytes
+    for (i = 0; i < 512; i++) {
+        buff[i] = SD_SpiTransfer(0xFF);
+    }
+    // Discard CRC
+    SD_SpiTransfer(0xFF);
+    SD_SpiTransfer(0xFF);
+
+    SD_CS_Deassert();
+    SD_SpiTransfer(0xFF);
+    return 0;
+}
+
+//*****************************************************************************
+//
+//! SD card: Write exactly one 512-byte block via CMD24.
+//! block_addr is block-index. buff must contain 512 bytes.
+//! Returns 0 on success; otherwise -1.
+//
+//*****************************************************************************
+static int
+SD_WriteBlock(
+    uint32_t block_addr,
+    const uint8_t *buff
+    )
+{
+    uint8_t resp;
+    uint16_t timeout;
+    int     i;
+
+    SD_CS_Assert();
+
+    if (SD_SendCmd(SD_CMD24, block_addr, 0x01) != 0x00) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    // Send one-byte "start block" token
+    SD_SpiTransfer(SD_TOKEN_START_BLOCK);
+
+    // Send 512 data bytes
+    for (i = 0; i < 512; i++) {
+        SD_SpiTransfer(buff[i]);
+    }
+    // Send dummy CRC
+    SD_SpiTransfer(0xFF);
+    SD_SpiTransfer(0xFF);
+
+    // Read data response token
+    resp = SD_SpiTransfer(0xFF);
+    if ((resp & 0x1F) != 0x05) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    // Wait until card is no longer busy
+    timeout = 0xFFFF;
+    do {
+        resp = SD_SpiTransfer(0xFF);
+    } while ((resp == 0x00) && --timeout);
+    if (timeout == 0) {
+        SD_CS_Deassert();
+        return -1;
+    }
+
+    SD_CS_Deassert();
+    SD_SpiTransfer(0xFF);
+    return 0;
+}
+
+//*****************************************************************************
+//
+//! CC3200: Initialize SPI0 (GSPI) for 3-wire+CS, 8-bit, mode0.
+//! Called before any SD commands. Clock starts <=400 kHz to allow card to init.
+//
+//*****************************************************************************
+static void
+SD_HWInit(void)
+{
+    //
+    // Enable GSPI peripheral clock
+    //
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI, PRCM_RUN_MODE_CLK);
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    //
+    // Configure GSPI pins in PinMuxConfig() (assumes you have already called PinMuxConfig())
+    //    - GPIO14 (GSPI CLK), GPIO15 (GSPI MISO), GPIO16 (GSPI MOSI), GPIO17 (GSPI CS)
+    //
+    MAP_SPIReset(GSPI_BASE);
+
+    //
+    // SPI format: 8 bits, Mode0, master, 3-wire+CS
+    // Start at a slow clock rate (100 kHz or so -> <= 400 kHz)
+    //
+    MAP_SPIConfigSetExpClk(
+        GSPI_BASE,
+        MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+        400000,                    // 400 kHz initial
+        SPI_MODE_MASTER,
+        SPI_SUB_MODE_0,
+        (SPI_SW_CTRL_CS    |
+         SPI_4PIN_MODE     |
+         SPI_TURBO_OFF     |
+         SPI_CS_ACTIVELOW  |  // CC3200’s API: low = selected
+         SPI_WL_8)
+    );
+    MAP_SPIEnable(GSPI_BASE);
+
+    // Deassert CS (pull HIGH) so that card sees >74 clocks
+    SD_CS_Deassert();
+}
+
+//*****************************************************************************
+//
+//! Board Initialization & Configuration
+//!   - Set up the VTOR/interrupts
+//!   - Call PinMuxConfig() to map SPI0, UART0 pins
+//
+//*****************************************************************************
+static void
+BoardInit(void)
+{
+#ifndef USE_TIRTOS
+    #if defined(ccs)
+        MAP_IntVTableBaseSet((unsigned long)&g_pfnVectors[0]);
+    #endif
+    #if defined(ewarm)
+        MAP_IntVTableBaseSet((unsigned long)&__vector_table);
+    #endif
+#endif
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+
+    PRCMCC3200MCUInit();
+}
+
+//*****************************************************************************
+//
+//! Wrapper functions for FatFs / diskio.c:
+//
+//   We need to provide:
+//     DSTATUS disk_initialize(BYTE pdrv);
+//     DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count);
+//     DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count);
+//     DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff);
+//
+//   We’ll implement them at the bottom of this file so FatFs can call them.
+//
+//*****************************************************************************
+
+//*****************************************************************************
+//
+//! Main
+//!   1. Initialize Board (VTOR, interrupts)
+//!   2. PinMuxConfig() -> maps CC3200 pins:
+//!        - SPI0 CLK/MOSI/MISO/CS
+//!        - UART0 TX/RX (for debugging)
+//!   3. UART0 init (terminal)
+//!   4. SD_HWInit() -> sets up SPI0 @ 400 kHz, deasserts CS
+//!   5. SD_InitCard() -> CMD0->CMD8>ACMD41->CMD58->CMD16
+//!   6. Increase SPI clock to <= 12 MHz (FatFs can run faster)
+//!   7. f_mount()
+//!   8. f_open( “DATA.CSV”, FA_OPEN_APPEND | FA_WRITE )
+//!   9. f_printf(&fil, "VALUE1,VALUE2,STRING\r\n")
+//!  10. f_close + f_mount(NULL)
+//
+//*****************************************************************************
+void
+main()
+{
+    FRESULT fr;
+    UINT     bw;
+    DWORD    free_clusters, free_sectors, total_sectors;
+    uint32_t t0;
+
+    //-------------------------------------------------------------------------
+    // 1) BoardInit + PinMux for SPI0 + UART0
+    BoardInit();
+    PinMuxConfig();    // Make sure your pinmux file routes GSPI pins (CLK/MOSI/MISO/CS) + UART0 pins
+
+    // 2) UART0 Setup (115200, 8-N-1) for debug messages
+    InitTerm();
+    ClearTerm();
+    Message("\n\n\n\r");
+    Message("\t\t   ********************************************\n\r");
+    Message("\t\t         CC3200 SD-SPI + FatFs Example  \n\r");
+    Message("\t\t   ********************************************\n\r\n\r");
+
+    // 3) Initialize SD over SPI @ 400 kHz
+    SD_HWInit();
+    Message("Initialized SPI0 @ 400 kHz\n\r");
+    Message("Attempting SD-Card initialization...\n\r");
+
+    if (SD_InitCard() != 0) {
+        Message(">> SD Init FAILED!\n\r");
+        while (1);
+    }
+    Message(">> SD Init: OK\n\r");
+
+    // 4) Raise SPI clock now that card is initialized
+    //    (Change to e.g. 6 MHz or 12 MHz -> <= 25 MHz max)
+    MAP_SPIConfigSetExpClk(
+        GSPI_BASE,
+        MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+        12000000,                 // 12 MHz
+        SPI_MODE_MASTER,
+        SPI_SUB_MODE_0,
+        (SPI_SW_CTRL_CS |
+         SPI_4PIN_MODE  |
+         SPI_TURBO_OFF  |
+         SPI_CS_ACTIVELOW |
+         SPI_WL_8)
+    );
+    Message("SPI clock set to 12 MHz for data transfers\n\r");
+
+    //-------------------------------------------------------------------------
+    // 5) Mount the FAT32 volume
+    fr = f_mount(&g_sFatFs, "", 1);
+    if (fr != FR_OK) {
+        Message(">> f_mount failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);
+    }
+    Message(">> f_mount: OK\n\r");
+
+    // (Optional) Get free space info
+    fr = f_getfree("", &free_clusters, &g_sFatFs);
+    if (fr == FR_OK) {
+        total_sectors  = (g_sFatFs.n_fatent - 2) * g_sFatFs.csize;
+        free_sectors   = free_clusters * g_sFatFs.csize;
+        Message("Total / Free clusters: ");
+        // You can convert to MB if you like. This is just for diagnostics:
+        Report("%lu / %lu clusters\n\r", (unsigned long)g_sFatFs.n_fatent - 2, (unsigned long)free_clusters);
+    }
+
+    //-------------------------------------------------------------------------
+    // 6) Open (or create) DATA.CSV in root, append mode
+    fr = f_open(&g_sFile, "DATA.CSV", FA_OPEN_APPEND | FA_WRITE);
+    if (fr != FR_OK) {
+        Message(">> f_open failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);
+    }
+    Message(">> f_open DATA.CSV: OK\n\r");
+
+    // 7) Write a sample CSV line (change these values to your sensor readings, etc.)
+    //    Format: SAMPLE1,SAMPLE2,HELLO_WORLD<CR><LF>
+    fr = f_printf(&g_sFile, "%lu,%lu,%s\r\n",
+                  (unsigned long)1234,
+                  (unsigned long)5678,
+                  "CC3200_SD_SDK");
+    if (fr < 0) {
+        Message(">> f_printf failed\n\r");
+        while (1);
+    }
+    Message(">> Wrote CSV line to DATA.CSV\n\r");
+
+    // 8) Close the file
+    fr = f_close(&g_sFile);
+    if (fr != FR_OK) {
+        Message(">> f_close failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);
+    }
+    Message(">> File closed, operation complete.\n\r");
+
+    // 9) Optionally unmount (or keep mounted if you want to write more later)
+    f_mount(NULL, "", 1);
+    Message(">> Volume unmounted.\n\r");
+
+    while (1) {
+        // Optionally blink LED or sleep
+        UtilsDelay(80000000);
+        GPIO_IF_LedToggle(MCU_ORANGE_LED_GPIO);
+    }
+}

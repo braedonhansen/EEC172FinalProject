@@ -1,0 +1,221 @@
+//*****************************************************************************
+//
+// main.c  — CC3200: Create a CSV file on microSD via SPI + FatFs
+//
+// This example initializes the CC3200’s SPI0 peripheral to talk to a standard
+// microSD card (wired as per the BoosterPack pinout: P07=CLK, P08=MOSI, P06=MISO,
+// P05=CS). It then mounts the volume using FatFs, creates/overwrites “DATA.CSV”
+// in the root directory, writes a header and a few sample rows via f_write(), and
+// blinks an LED to indicate activity.
+//
+// Assumes these files are present and on the include path:
+//   • ff.c, ff.h, ffconf.h         (FatFs R0.10c)
+//   • diskio.c, diskio.h           (SPI-based disk I/O glue) :contentReference[oaicite:2]{index=2}
+//   • pinmux.c, pinmux.h           (PinMuxConfig for SPI0)
+//   • uart_if.c, uart_if.h         (UART0 helper for debug prints)
+//   • gpio_if.c, gpio_if.h         (Optional: LED API if you choose to toggle LEDs)
+//
+// Note: diskio.c must implement DSTATUS disk_initialize(), disk_read(), disk_write()
+//       over SPI commands (CMD0, CMD8, ACMD41, CMD17, CMD24, etc.).
+//
+//*****************************************************************************
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+// TI Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "hw_ints.h"
+#include "spi.h"
+#include "prcm.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "interrupt.h"
+
+// Board-support includes
+#include "pin_mux_config.h"      // PinMuxConfig() - configures SPI0 pins: CLK/MOSI/MISO/CS
+#include "uart_if.h"     // InitTerm(), ClearTerm(), Message(), Report()
+#include "gpio_if.h"     // GPIO_IF_LedConfigure(), GPIO_IF_LedToggle(), GPIO_IF_LedOff()
+
+// FatFs includes
+#include "ff.h"
+#include "diskio.h"
+
+#define APPLICATION_NAME    "CC3200 SPI CSV Writer"
+#define APPLICATION_VERSION "1.0.0"
+
+//*****************************************************************************
+
+static void
+BoardInit(void)
+{
+    // Minimal board init: enable interrupts and configure MCU clock
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+    PRCMCC3200MCUInit();
+}
+
+//*****************************************************************************
+
+static void
+SPI0_Init(void)
+{
+    // Enable and reset SPI0 (GSPI)
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI, PRCM_RUN_MODE_CLK);
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    // SPI0: master, mode 0, 8-bit, SW control CS, CS active-low
+    MAP_SPIReset(GSPI_BASE);
+    MAP_SPIConfigSetExpClk(
+        GSPI_BASE,
+        MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+        400000,                    /* 400 kHz initial clock for card initialization */
+        SPI_MODE_MASTER,
+        SPI_SUB_MODE_0,
+        (SPI_SW_CTRL_CS |
+         SPI_4PIN_MODE  |
+         SPI_TURBO_OFF  |
+         SPI_CS_ACTIVELOW |
+         SPI_WL_8)
+    );
+    MAP_SPIEnable(GSPI_BASE);
+
+    // Deassert CS (pull high) and send one extra 0xFF
+    MAP_SPICSEnable(GSPI_BASE);
+    MAP_SPIDataPut(GSPI_BASE, 0xFF);
+    {
+        unsigned long dummy;
+        MAP_SPIDataGet(GSPI_BASE, &dummy);
+    }
+}
+
+//*****************************************************************************
+
+int
+main(void)
+{
+    FRESULT    fr;
+    FATFS      fatfs;     // File system object
+    FIL        fil;       // File object
+    UINT       bw;
+    char       lineBuf[64];
+    uint32_t   t;         // Loop counter
+
+    // 1) Board + PinMux + UART init
+    BoardInit();
+    PinMuxConfig();        // Must configure SPI0 pins: P07=CLK, P08=MOSI, P06=MISO, P05=CS
+    InitTerm();            // UART0 @115200 for debug
+    ClearTerm();
+
+    Message("\n\n\n\r");
+    Message("\t***************************************\n\r");
+    Message("\t  " APPLICATION_NAME "  \n\r");
+    Message("\t         Ver. " APPLICATION_VERSION "\n\r");
+    Message("\t***************************************\n\r");
+    Message("\n\r");
+
+    // 2) Initialize SPI0 for SD-card in SPI mode
+    SPI0_Init();
+    Message("SPI0 initialized @ 400 kHz for SD init\n\r");
+
+    // 3) Mount the default drive (logical “0:” because _VOLUMES=1) :contentReference[oaicite:4]{index=4}
+    fr = f_mount(&fatfs, "", 1);
+    if (fr != FR_OK) {
+        Report("f_mount failed: %d\n\r", fr);
+        while (1);
+    }
+    Message(">> f_mount: OK\n\r");
+
+    // 4) Open (or create) “DATA.CSV” in root, overwrite if it exists
+    fr = f_open(&fil, "DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        Report("f_open failed: %d\n\r", fr);
+        while (1);
+    }
+    Message(">> f_open DATA.CSV: OK\n\r");
+
+    // 5) Write CSV header: “Time_ms,SensorA,SensorB\r\n”
+    strcpy(lineBuf, "Time_ms,SensorA,SensorB\r\n");
+    fr = f_write(&fil, lineBuf, strlen(lineBuf), &bw);
+    if (fr != FR_OK || bw != strlen(lineBuf)) {
+        Report("f_write header failed: %d\n\r", fr);
+        f_close(&fil);
+        while (1);
+    }
+    Message(">> Wrote header\n\r");
+
+    // 6) Write 10 sample rows at ~100 ms intervals
+    for (t = 0; t < 10; t++) {
+        uint32_t time_ms = t * 100;
+        float    sensorA = 23.5f + 0.1f * t;
+        float    sensorB = 47.2f - 0.2f * t;
+
+        // Build a comma-separated line into lineBuf
+        // Format: “%lu,%.2f,%.2f\r\n”
+        // Ensure buffer is large enough: e.g. "100,23.60,46.00\r\n" fits in 20 bytes.
+        sprintf(lineBuf, "%lu,%.2f,%.2f\r\n",
+                (unsigned long)time_ms,
+                sensorA,
+                sensorB);
+
+        fr = f_write(&fil, lineBuf, strlen(lineBuf), &bw);
+        if (fr != FR_OK || bw != strlen(lineBuf)) {
+            Report("f_write row %lu failed: %d\n\r", (unsigned long)t, fr);
+            break;
+        }
+
+        Report("Row %lu: %s", (unsigned long)t, lineBuf);
+
+        // Toggle an LED to show activity (optional)
+        GPIO_IF_LedToggle(MCU_GREEN_LED_GPIO);
+
+        // Delay ~100 ms (~Exact cycles vary; adjust as needed)
+        UtilsDelay(8000000);
+    }
+
+    // 7) Close the file
+    fr = f_close(&fil);
+    if (fr != FR_OK) {
+        Report("f_close failed: %d\n\r", fr);
+        while (1);
+    }
+    Message(">> f_close: OK\n\r");
+
+    // 8) Unmount volume (optional)
+    fr = f_mount(NULL, "", 1);
+    if (fr != FR_OK) {
+        Report("f_mount(NULL) failed: %d\n\r", fr);
+    } else {
+        Message(">> Volume unmounted.\n\r");
+    }
+
+    // 9) Ramp up SPI clock for any further reads/writes (12 MHz)
+    MAP_SPIConfigSetExpClk(
+        GSPI_BASE,
+        MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+        12000000,                 /* 12 MHz for faster throughput */
+        SPI_MODE_MASTER,
+        SPI_SUB_MODE_0,
+        (SPI_SW_CTRL_CS |
+         SPI_4PIN_MODE  |
+         SPI_TURBO_OFF  |
+         SPI_CS_ACTIVELOW |
+         SPI_WL_8)
+    );
+
+    // 10) Finished writing. Blink LED forever to indicate success
+    Message("\n\rDone writing DATA.CSV via SPI. Blinking LED...\n\r");
+    GPIO_IF_LedConfigure(LED1 | LED2 | LED3);
+    GPIO_IF_LedOff(MCU_ALL_LED_IND);
+
+    while (1) {
+        GPIO_IF_LedToggle(MCU_ORANGE_LED_GPIO);
+        UtilsDelay(80000000);
+    }
+
+    // Should never reach here
+    return 0;
+}

@@ -1,0 +1,99 @@
+#include <string.h>
+#include <stdio.h>
+
+// Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "pin.h"
+#include "spi.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "prcm.h"
+#include "uart.h"
+#include "interrupt.h"
+
+// FatFs includes
+#include "ff.h"
+
+// Common interface includes
+#include "uart_if.h"
+#include "pin_mux_config.h"
+
+// Defines
+#define SPI_IF_BIT_RATE 1000000
+#define APPLICATION_VERSION "1.0.0"
+#define CSV_FILENAME "log.csv"
+
+FATFS FatFs;
+FIL fil;
+
+void BoardInit(void) {
+    MAP_IntMasterEnable();
+    MAP_IntEnable(15);
+    PRCMCC3200MCUInit();
+}
+
+void InitSPI(void) {
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI, PRCM_RUN_MODE_CLK);
+
+    MAP_PinTypeSPI(PIN_05, PIN_MODE_0);  // CLK
+    MAP_PinTypeSPI(PIN_06, PIN_MODE_0);  // MISO
+    MAP_PinTypeSPI(PIN_07, PIN_MODE_0);  // MOSI
+
+    SPIReset(GSPI_BASE);
+    SPIConfigSetExpClk(GSPI_BASE, PRCMPeripheralClockGet(PRCM_GSPI),
+                       SPI_IF_BIT_RATE, SPI_MODE_MASTER, SPI_SUB_MODE_0,
+                       (SPI_SW_CTRL_CS | SPI_4PIN_MODE | SPI_TURBO_OFF |
+                        SPI_CS_ACTIVELOW | SPI_WL_8));
+    SPIEnable(GSPI_BASE);
+}
+
+void WriteCSV(void) {
+    FRESULT res;
+    UINT bytesWritten;
+
+    // Mount filesystem
+    res = f_mount(&FatFs, "", 1);
+    if (res != FR_OK) {
+        Message("f_mount error: %d\n", res);
+        return;
+    }
+
+    // Create new CSV file
+    res = f_open(&fil, CSV_FILENAME, FA_WRITE | FA_CREATE_ALWAYS);
+    if (res != FR_OK) {
+        Message("f_open error: %d\n", res);
+        return;
+    }
+
+    // Write header
+    char *header = "Time,Temperature,Humidity\n";
+    res = f_write(&fil, header, strlen(header), &bytesWritten);
+
+    // Write 10 rows of data
+    char row[64];
+    int i = 0;
+    for (i = 0; i < 10; i++) {
+        snprintf(row, sizeof(row), "%d,%.2f,%.2f\n", i, 20.5 + i, 50.0 - i);
+        res = f_write(&fil, row, strlen(row), &bytesWritten);
+    }
+
+    f_close(&fil);
+    UARTprintf("CSV written successfully.\n");
+}
+
+int main(void) {
+    BoardInit();
+    PinMuxConfig();
+    InitTerm();      // UART
+    ClearTerm();
+    InitSPI();       // SPI interface
+
+    UARTprintf("CC3200 SD Write Example - v%s\n", APPLICATION_VERSION);
+
+    WriteCSV();
+
+    while (1); // Halt
+}

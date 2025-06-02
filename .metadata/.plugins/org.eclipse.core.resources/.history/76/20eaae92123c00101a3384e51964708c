@@ -1,0 +1,93 @@
+#include <string.h>
+
+// Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "hw_ints.h"
+#include "spi.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "prcm.h"
+#include "uart.h"
+#include "interrupt.h"
+#include "ff.h"
+
+// Common interface includes
+#include "uart_if.h"
+#include "pin_mux_config.h"
+
+// Globals
+FATFS FatFs;    // File system object
+FIL fil;        // File object
+FRESULT fr;     // FatFs return code
+char buffer[128];
+
+#define SPI_IF_BIT_RATE  1000000
+
+void InitBoard() {
+    MAP_IntVTableBaseSet((unsigned long)&g_pfnVectors[0]);
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+
+    PRCMCC3200MCUInit();
+}
+
+void InitSPI() {
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI, PRCM_RUN_MODE_CLK);
+    MAP_PinTypeSPI(PIN_05, PIN_MODE_7); // CLK
+    MAP_PinTypeSPI(PIN_06, PIN_MODE_7); // MISO
+    MAP_PinTypeSPI(PIN_07, PIN_MODE_7); // MOSI
+
+    SPIReset(GSPI_BASE);
+    SPIConfigSetExpClk(GSPI_BASE, PRCMPeripheralClockGet(PRCM_GSPI),
+                       SPI_IF_BIT_RATE, SPI_MODE_MASTER, SPI_SUB_MODE_0,
+                       (SPI_SW_CTRL_CS | SPI_4PIN_MODE | SPI_TURBO_OFF |
+                        SPI_CS_ACTIVELOW | SPI_WL_8));
+    SPIEnable(GSPI_BASE);
+}
+
+void WriteCSVToSD() {
+    // Mount file system
+    fr = f_mount(&FatFs, "", 1);
+    if (fr != FR_OK) {
+        UARTprintf("Failed to mount SD card: %d\n", fr);
+        return;
+    }
+
+    // Open file for writing
+    fr = f_open(&fil, "data.csv", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        UARTprintf("Failed to open file: %d\n", fr);
+        return;
+    }
+
+    // Write header
+    f_printf(&fil, "Time,Temperature,Humidity\n");
+
+    // Write example data
+    for (int i = 0; i < 10; i++) {
+        snprintf(buffer, sizeof(buffer), "%d,%0.2f,%0.2f\n", i, 22.5 + i, 55.0 - i);
+        f_printf(&fil, buffer);
+    }
+
+    f_close(&fil);
+    UARTprintf("CSV write complete.\n");
+}
+
+int main(void) {
+    InitBoard();
+    PinMuxConfig();
+    InitSPI();
+
+    // Init UART
+    InitTerm();
+    ClearTerm();
+
+    UARTprintf("Starting CSV write...\n");
+
+    WriteCSVToSD();
+
+    while (1); // Done
+}

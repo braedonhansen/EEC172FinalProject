@@ -1,0 +1,172 @@
+//*****************************************************************************
+//
+// main.c  — CC3200: Create a CSV file on microSD using FatFs + SDHost
+//
+//*****************************************************************************
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+// TI Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_ints.h"
+#include "hw_common_reg.h"
+#include "prcm.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "interrupt.h"
+
+// Board-support includes
+#include "pin_mux_config.h"     // PinMuxConfig()
+#include "uart_if.h"    // InitTerm(), ClearTerm(), Message(), Report()
+#include "gpio_if.h"    // GPIO_IF_LedConfigure(), GPIO_IF_LedOff(), GPIO_IF_LedToggle()
+
+// FatFs includes
+#include "ff.h"
+#include "diskio.h"
+
+#define APPLICATION_NAME    "CC3200 CSV Writer"
+#define APPLICATION_VERSION "1.0.0"
+
+//*****************************************************************************
+//
+//! BoardInit
+//!   Minimal board initialization—enable interrupts and PRCM.
+//!   We remove the g_pfnVectors reference so it compiles cleanly.
+//
+//*****************************************************************************
+static void
+BoardInit(void)
+{
+    // Enable processor interrupts
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+
+    // Initialize the MCU clock
+    PRCMCC3200MCUInit();
+}
+
+//*****************************************************************************
+//
+//! main
+//!   1) BoardInit + PinMuxConfig + UART init
+//!   2) Mount SD via FatFs
+//!   3) Create/overwrite “DATA.CSV”
+//!   4) Write header + 10 sample rows
+//!   5) Close file and unmount
+//!   6) Blink LED forever
+//
+//*****************************************************************************
+int
+main(void)
+{
+    FRESULT    fr;
+    FATFS      fatfs;     // Filesystem object
+    FIL        fil;       // File object
+    UINT       bw;
+    uint32_t   t;         // Loop variable (declared here for C89 compatibility)
+
+    // 1) Basic board + UART init
+    BoardInit();
+    PinMuxConfig();        // Configure pins for SDHost (CMD, CLK, DAT0)
+    InitTerm();            // UART0 @ 115200 for debug output
+    ClearTerm();
+
+    Message("\n\n\n\r");
+    Message("\t***************************************\n\r");
+    Message("\t  " APPLICATION_NAME "  \n\r");
+    Message("\t         Ver. " APPLICATION_VERSION "\n\r");
+    Message("\t***************************************\n\r");
+    Message("\n\r");
+
+    // 2) Mount the default drive ("" = logical drive 0)
+    fr = f_mount(&fatfs, "", 1);
+    if (fr != FR_OK) {
+        Message("f_mount failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);  // Cannot proceed
+    }
+    Message(">> f_mount: OK\n\r");
+
+    // 3) Create (or overwrite) “DATA.CSV”
+    fr = f_open(&fil, "DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        Message("f_open failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);
+    }
+    Message(">> f_open DATA.CSV: OK\n\r");
+
+    // 4) Write CSV header row
+    fr = f_printf(&fil, "Time_ms,SensorA,SensorB\r\n");
+    if (fr < 0) {
+        Message("f_printf header failed\n\r");
+        while (1);
+    }
+    Message(">> Wrote header\n\r");
+
+    // 5) Write 10 sample data rows (delay 100 ms between each)
+    for (t = 0; t < 10; t++) {
+        uint32_t time_ms = t * 100;
+        float    sensorA = 23.5f + 0.1f * t;
+        float    sensorB = 47.2f - 0.2f * t;
+
+        fr = f_printf(&fil, "%lu,%.2f,%.2f\r\n",
+                      (unsigned long)time_ms,
+                      sensorA,
+                      sensorB);
+        if (fr < 0) {
+            Message("f_printf data row failed\n\r");
+            break;
+        }
+
+        Report("Row %lu: %lu, %.2f, %.2f\r\n",
+               (unsigned long)t,
+               (unsigned long)time_ms,
+               sensorA,
+               sensorB);
+
+        // Toggle LED to show activity
+        GPIO_IF_LedToggle(MCU_GREEN_LED_GPIO);
+
+        // Delay ~100 ms (tunable)
+        UtilsDelay(8000000);
+    }
+
+    // 6) Close the file
+    fr = f_close(&fil);
+    if (fr != FR_OK) {
+        Message("f_close failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+        while (1);
+    }
+    Message(">> f_close: OK\n\r");
+
+    // 7) Unmount (optional)
+    fr = f_mount(NULL, "", 1);
+    if (fr != FR_OK) {
+        Message("f_mount(NULL) failed: ");
+        Message(f_get_rc_str(fr));
+        Message("\n\r");
+    } else {
+        Message(">> Volume unmounted.\n\r");
+    }
+
+    // 8) Done – blink LED forever
+    Message("\n\rDone writing DATA.CSV. Blinking LED...\n\r");
+    GPIO_IF_LedConfigure(LED1 | LED2 | LED3);
+    GPIO_IF_LedOff(MCU_ALL_LED_IND);
+
+    while (1) {
+        GPIO_IF_LedToggle(MCU_ORANGE_LED_GPIO);
+        UtilsDelay(80000000);
+    }
+
+    // Should never reach here
+    return 0;
+}

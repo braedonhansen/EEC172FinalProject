@@ -1,0 +1,188 @@
+//*****************************************************************************
+//
+// Application: Ultrasonic HC-SR04 Timing Demo on CC3200 LaunchPad (Revised for Compilation)
+//
+// Description:
+// This code triggers an HC-SR04 ultrasonic module every 1 second using PIN_15,
+// then measures the echo pulse duration on PIN_58, converts the timer ticks to
+// microseconds, and sends the result over UART, preserving existing pin_mux and UART/Timer_IF initialization.
+//
+// Pin assignments (as defined in pin_mux_config.h):
+//   TRIGGER  -> PIN_15 (GPIO22) as output
+//   ECHO     -> PIN_58 (GPIO19) as input with interrupt on both edges
+//
+// Timers used:
+//   TIMERA0  -> Continual free-running 32-bit up-counter to timestamp echo edges
+//   SysTick  -> Generates 1-second periodic interrupt to start trigger sequence
+//
+// Interrupt flow:
+//   SysTickHandler: every 1 second, send 10µs trigger pulse on PIN_15
+//   GPIOECHOHandler: on rising edge of ECHO, record timestamp; on falling edge, compute delta, send via UART
+//
+// All peripheral initializations (PinMuxConfig, UART_IF_Init, Timer_IF_Init) are retained.
+//*****************************************************************************
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+// Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_ints.h"
+#include "prcm.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "gpio.h"
+#include "timer.h"
+#include "interrupt.h"
+#include "uart_if.h"
+#include "pin_mux_config.h"
+#include "utils.h"
+#include "hw_nvic.h"
+
+//*****************************************************************************
+// Macro Definitions
+//*****************************************************************************
+#define SYSCLKFREQ            80000000ULL
+#define US_TO_TICKS(us)       ((SYSCLKFREQ / 1000000ULL) * (us))
+#define SYSTICK_RELOAD_VAL    (SYSCLKFREQ) // 1-second period (80MHz ticks)
+
+//*****************************************************************************
+// Global Variables
+//*****************************************************************************
+static volatile uint32_t g_ulEchoStart = 0;
+static volatile bool     g_bEchoRising = false;
+
+//*****************************************************************************
+//! SysTick Interrupt Handler
+//! Triggers HC-SR04 pulse every 1 second.
+//*****************************************************************************
+void
+SysTickHandler(void)
+{
+    // Generate 10µs trigger pulse on PIN_15 (GPIO22)
+    GPIO_IF_Set(GPIOA2_BASE, GPIO_PIN_6);   // Set PIN_15 HIGH
+    MAP_UtilsDelay(US_TO_TICKS(10) / 3);     // ~10µs delay
+    GPIO_IF_Clear(GPIOA2_BASE, GPIO_PIN_6); // Set PIN_15 LOW
+
+    // Reset SysTick to reload next 1s
+    MAP_SysTickValueSet(0);
+}
+
+//*****************************************************************************
+//! GPIO Interrupt Handler for Echo Pin (PIN_58)
+//! Captures rising and falling edges to measure pulse width.
+//*****************************************************************************
+void
+GPIOECHOHandler(void)
+{
+    uint32_t ulStatus;
+    uint32_t ulTimerVal;
+    char     msg[64];
+
+    // Get and clear interrupt status for GPIOA3 (PIN_58)
+    ulStatus = MAP_GPIOIntStatus(GPIOA3_BASE, true);
+    MAP_GPIOIntClear(GPIOA3_BASE, ulStatus);
+
+    if (ulStatus & GPIO_PIN_3) // PIN_58 = PA3.3
+    {
+        // Read current timer count
+        ulTimerVal = MAP_TimerValueGet(TIMERA0_BASE, TIMER_A);
+
+        if (!g_bEchoRising)
+        {
+            // Rising edge detected: record start time
+            g_ulEchoStart = ulTimerVal;
+            g_bEchoRising = true;
+        }
+        else
+        {
+            // Falling edge detected: compute pulse width
+            uint32_t ulDelta;
+            if (ulTimerVal <= g_ulEchoStart)
+            {
+                // Roll-over occurred
+                ulDelta = (0xFFFFFFFF - g_ulEchoStart) + ulTimerVal + 1;
+            }
+            else
+            {
+                ulDelta = ulTimerVal - g_ulEchoStart;
+            }
+            g_bEchoRising = false;
+
+            // Convert ticks to microseconds
+            uint32_t ulPulseUs = (ulDelta * 1000000ULL) / SYSCLKFREQ;
+
+            // Send result over UART0
+            usnprintf(msg, sizeof(msg), "Echo pulse: %u us\r\n", ulPulseUs);
+            UART_PRINT(msg);
+        }
+    }
+}
+
+//*****************************************************************************
+//! Board Initialization
+//*****************************************************************************
+static void
+BoardInit(void)
+{
+#ifndef USE_TIRTOS
+    MAP_IntVTableBaseSet((unsigned long)&g_pfnVectors[0]);
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+#endif
+    PRCMCC3200MCUInit();
+}
+
+//*****************************************************************************
+//! Main Function
+//*****************************************************************************
+int
+main(void)
+{
+    // Initialize board (vector table, clocks)
+    BoardInit();
+
+    // Configure pin muxing (from pin_mux_config.h)
+    PinMuxConfig();
+
+    // --- Configure Trigger Pin (PIN_15) as GPIO output ---
+    PinTypeGPIO(PIN_15, PIN_MODE_0, false);
+    GPIODirModeSet(GPIOA2_BASE, GPIO_PIN_6, GPIO_DIR_MODE_OUT); // GPIO22 = PA2.6
+    GPIO_IF_Clear(GPIOA2_BASE, GPIO_PIN_6);                     // Ensure LOW
+
+    // --- Configure Echo Pin (PIN_58) as GPIO input with interrupt ---
+    PinTypeGPIO(PIN_58, PIN_MODE_0, false);
+    GPIODirModeSet(GPIOA3_BASE, GPIO_PIN_3, GPIO_DIR_MODE_IN); // GPIO19 = PA3.3
+    GPIOIntTypeSet(GPIOA3_BASE, GPIO_PIN_3, GPIO_BOTH_EDGES);
+    GPIOIntRegister(GPIOA3_BASE, GPIOECHOHandler);
+    GPIOIntEnable(GPIOA3_BASE, GPIO_PIN_3);
+
+    // --- Initialize TimerA0 as free-running 32-bit up-counter ---
+    PRCMPeripheralClkEnable(PRCM_TIMERA0, PRCM_RUN_MODE_CLK);
+    PRCMPeripheralReset(PRCM_TIMERA0);
+    MAP_TimerDisable(TIMERA0_BASE, TIMER_A);
+    MAP_TimerConfigure(TIMERA0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PERIODIC_UP);
+    MAP_TimerLoadSet(TIMERA0_BASE, TIMER_A, 0xFFFFFFFF);
+    MAP_TimerEnable(TIMERA0_BASE, TIMER_A);
+
+    // --- Configure SysTick for 1-second interrupts ---
+    MAP_SysTickPeriodSet(SYSTICK_RELOAD_VAL);
+    MAP_SysTickIntRegister(SysTickHandler);
+    MAP_SysTickIntEnable();
+    MAP_SysTickEnable();
+
+    // --- Initialize UART0 for console output (using existing UART_IF) ---
+    UART_IF_Init(); // Assumes UART_IF_Init configures UARTA0 at 115200
+
+    // Main loop does nothing; work is interrupt-driven
+    while (1)
+    {
+        // Idle
+        MAP_UtilsDelay(80000000);
+    }
+
+    return 0;
+}

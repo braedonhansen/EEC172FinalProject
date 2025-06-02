@@ -1,0 +1,175 @@
+//*****************************************************************************
+//
+// main.c  — CC3200: Create a CSV file on microSD using FatFs + SDHost
+//
+// This version uses f_write() + sprintf() instead of f_printf(), and omits
+// all GPIO_IF_Led* calls so that you don’t need gpio_if.c.
+//*****************************************************************************
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>    // for sprintf()
+#include <string.h>
+
+// TI Driverlib includes
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_ints.h"
+#include "hw_common_reg.h"
+#include "prcm.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "interrupt.h"
+
+// Board-support includes
+#include "pin_mux_config.h"     // PinMuxConfig()
+#include "uart_if.h"    // InitTerm(), ClearTerm(), Message(), Report()
+
+// FatFs includes
+#include "ff.h"
+#include "diskio.h"
+
+#define APPLICATION_NAME    "CC3200 CSV Writer"
+#define APPLICATION_VERSION "1.0.0"
+
+//*****************************************************************************
+//
+//! BoardInit
+//!   Minimal board initialization—enable interrupts and PRCM.
+//
+//*****************************************************************************
+static void
+BoardInit(void)
+{
+    // Enable processor interrupts
+    MAP_IntMasterEnable();
+    MAP_IntEnable(FAULT_SYSTICK);
+
+    // Initialize MCU clock
+    PRCMCC3200MCUInit();
+}
+
+//*****************************************************************************
+//
+//! main
+//!   1) BoardInit + PinMuxConfig + UART init
+//!   2) Mount SD via FatFs
+//!   3) Create/overwrite “DATA.CSV”
+//!   4) Write header + 10 sample rows via f_write()
+//!   5) Close file and unmount
+//!   6) Blink on UART (no LEDs)
+//
+//*****************************************************************************
+int
+main(void)
+{
+    FRESULT    fr;
+    FATFS      fatfs;     // Filesystem object
+    FIL        fil;       // File object
+    UINT       bw;
+    char       line[64];
+    uint32_t   t;
+
+    // 1) Basic board + UART init
+    BoardInit();
+    PinMuxConfig();        // Configure pins for SDHost (CMD, CLK, DAT0)
+    InitTerm();            // UART0 @ 115200 for debug output
+    ClearTerm();
+
+    Message("\n\n\n\r");
+    Message("\t***************************************\n\r");
+    Message("\t  " APPLICATION_NAME "  \n\r");
+    Message("\t         Ver. " APPLICATION_VERSION "\n\r");
+    Message("\t***************************************\n\r");
+    Message("\n\r");
+
+    // 2) Mount the default drive ("" = logical drive 0)
+    fr = f_mount(&fatfs, "", 1);
+    if (fr != FR_OK) {
+        Message("f_mount failed: ");
+        Report("%d\n\r", fr);
+        while (1);  // Cannot proceed
+    }
+    Message(">> f_mount: OK\n\r");
+
+    // 3) Create (or overwrite) “DATA.CSV”
+    fr = f_open(&fil, "DATA.CSV", FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        Message("f_open failed: ");
+        Report("%d\n\r", fr);
+        while (1);
+    }
+    Message(">> f_open DATA.CSV: OK\n\r");
+
+    // 4) Write CSV header row using sprintf() + f_write()
+    {
+        int len = sprintf(line, "Time_ms,SensorA,SensorB\r\n");
+        fr = f_write(&fil, line, len, &bw);
+        if (fr != FR_OK) {
+            Message("f_write header failed: ");
+            Report("%d\n\r", fr);
+            while (1);
+        }
+        Message(">> Wrote header\n\r");
+    }
+
+    // 5) Write 10 sample data rows (delay 100 ms between each)
+    for (t = 0; t < 10; t++) {
+        uint32_t time_ms = t * 100;
+        float    sensorA = 23.5f + 0.1f * t;
+        float    sensorB = 47.2f - 0.2f * t;
+
+        // Build one CSV line into 'line[]'
+        int len = sprintf(
+            line,
+            "%lu,%.2f,%.2f\r\n",
+            (unsigned long)time_ms,
+            sensorA,
+            sensorB
+        );
+
+        fr = f_write(&fil, line, len, &bw);
+        if (fr != FR_OK) {
+            Message("f_write data row failed: ");
+            Report("%d\n\r", fr);
+            break;
+        }
+
+        Report("Row %lu: %lu, %.2f, %.2f\r\n",
+               (unsigned long)t,
+               (unsigned long)time_ms,
+               sensorA,
+               sensorB);
+
+        // Delay ~100 ms
+        UtilsDelay(8000000);
+    }
+
+    // 6) Close the file
+    fr = f_close(&fil);
+    if (fr != FR_OK) {
+        Message("f_close failed: ");
+        Report("%d\n\r", fr);
+        while (1);
+    }
+    Message(">> f_close: OK\n\r");
+
+    // 7) Unmount (optional)
+    fr = f_mount(NULL, "", 1);
+    if (fr != FR_OK) {
+        Message("f_mount(NULL) failed: ");
+        Report("%d\n\r", fr);
+    } else {
+        Message(">> Volume unmounted.\n\r");
+    }
+
+    // 8) Done – just loop
+    Message("\n\rDone writing DATA.CSV. Waiting...\n\r");
+    while (1) {
+        // No LED – simply idle or you could add a UART heartbeat
+        UtilsDelay(80000000);
+    }
+
+    // Should never reach here
+    return 0;
+}

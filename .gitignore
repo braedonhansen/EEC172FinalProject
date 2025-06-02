@@ -1,0 +1,34 @@
+# Ignore build artifacts
+*.out
+*.obj
+*.o
+*.d
+*.bin
+*.hex
+*.map
+*.elf
+*.log
+
+# Ignore Code Composer Studio specific files
+*.launches
+*.ccsproject
+*.cproject
+*.project
+*.settings/
+Debug/
+Release/
+workspace/
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Ignore JxBrowser temp/session files
+.jxbrowser.userdata/
+
+# Ignore Python bytecode if used
+__pycache__/
+*.pyc
+*.pyo
