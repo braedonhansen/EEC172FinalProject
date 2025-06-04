@@ -7,6 +7,8 @@
 
 csvFile = 'C:\Users\Braedon\Downloads\PLEASE.csv'; % change for your .csv
 
+movement = 1;
+
 % Sampling interval (seconds) between successive points (e.g. 0.05 for 20 Hz)
 dt = 0.05;
 
@@ -85,9 +87,13 @@ for i = 1:N
     end
 end
 
-
-X_world = y_scan + pos(:,1);
-Y_world = x_scan + pos(:,2);
+if(movement)
+    X_world = y_scan + pos(:,1);
+    Y_world = x_scan + pos(:,2);
+else
+    X_world = y_scan; % + pos(:,1);
+    Y_world = x_scan; % + pos(:,2);
+end
 close all;
 figure;
 plot(-X_world, Y_world, '.-');
@@ -95,7 +101,18 @@ xlabel('X (m)');
 ylabel('Y (m)');
 axis equal;
 title('D + IMU Reconstructed Scan');
-hold on;
-plot(-pos(:,1), pos(:,2), 'r-', 'LineWidth', 2);
-legend('Scan points','Device path','Location','Best');
-hold off;
+if(movement)
+    hold on;
+    plot(-pos(:,1), pos(:,2), 'r-', 'LineWidth', 2);
+    legend('Scan points','Device path','Location','Best');
+    Connect each scan point to its device location
+    for i = 1:N
+        devX = -pos(i,1);
+        devY =  pos(i,2);
+        scanX = -X_world(i);
+        scanY =  Y_world(i);
+        plot([devX, scanX], [devY, scanY], 'g-');
+    end
+end
+% 
+% hold off;
